@@ -229,7 +229,7 @@ export const getUserbyID = async (req, res) => {
 
 export const signUp = async (req, res) => {
     try {
-        const { firstname, email, lastname = "0", password, confirmpassword = "0", selectedPlan, promocode = null } = req.body;
+        const { firstname, email, lastname = "0", password, confirmpassword = "0", selectedPlan, promocode = null, phone_number, whatsapp_number = null } = req.body;
         console.log("req.body", req.body);
 
         // Check if the email already exists
@@ -244,7 +244,7 @@ export const signUp = async (req, res) => {
             return res.status(400).json({ message: "Selected subscription plan does not exist" });
         }
 
-        let originalAmount = parseFloat(subscription[0].amount);
+        let originalAmount = parseFloat(subscription[0].original_price);
         let finalAmount = originalAmount;
         let discountApplied = 0;
         let referredBy = null;
@@ -261,9 +261,9 @@ export const signUp = async (req, res) => {
                 finalAmount = originalAmount - discountApplied;
 
                 // ✅ Commission for referrer (20%)
-                commissionEarned = discountApplied;
+                commissionEarned = (originalAmount * 20) / 100;
 
-                // ✅ Don't change promocode status so it remains active for future users
+                // ✅ Insert commission record
                 await pool.query(
                     "INSERT INTO commission (user_id, earned_by, amount, status) VALUES (?, ?, ?, ?)",
                     [referredBy, email, commissionEarned, 'pending']
@@ -279,21 +279,15 @@ export const signUp = async (req, res) => {
 
         // ✅ Insert user data into the database
         const [userResult] = await pool.query(
-            "INSERT INTO users (firstname, lastname, email, password, is_active, confirmpassword, promocode, referred_by,is_logged_in) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [firstname, lastname, email, hashPassword, 1, confirmpassword, generatedPromoCode, referredBy, false]
+            "INSERT INTO users (firstname, lastname, email, password, is_active, confirmpassword, promocode, referred_by, is_logged_in, phone_number, whatsapp_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [firstname, lastname, email, hashPassword, 1, confirmpassword, generatedPromoCode, referredBy, false, phone_number, whatsapp_number]
         );
         const userId = userResult.insertId;
-        console.log("userId", userId);
-
-
-
 
         const startDate = new Date();
         let endDate = new Date();
 
-        if (selectedPlan.toLowerCase() === "monthly" || selectedPlan.toLowerCase() === "1 month") {
-
-
+        if (selectedPlan.toLowerCase() === "monthly" || selectedPlan.toLowerCase() === "1 month" || selectedPlan.toLowerCase() === "30 days") {
             endDate.setMonth(endDate.getMonth() + 1);
         } else if (selectedPlan.toLowerCase() === "6 months") {
             endDate.setMonth(endDate.getMonth() + 6);
@@ -305,12 +299,10 @@ export const signUp = async (req, res) => {
         const oneDay = 24 * 60 * 60 * 1000;
         const remaining_days = Math.ceil((endDate - startDate) / oneDay);
 
-
-
         // ✅ Insert Subscription Data
         await pool.query(
-            "INSERT INTO subscriptions (user_id, plan_name, amount, original_price, discount_applied, promocode, start_date, end_date, is_active, referred_by, remaining_days) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,?)",
-            [userId, selectedPlan, finalAmount, originalAmount, discountApplied, generatedPromoCode, startDate, endDate, 1, referredBy, remaining_days]
+            "INSERT INTO subscriptions (user_id, plan_name, amount, original_price, discount_applied, promocode, start_date, end_date, is_active, referred_by, remaining_days, shopier_link_normal, shopier_link_discount) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [userId, selectedPlan, finalAmount, originalAmount, discountApplied, generatedPromoCode, startDate, endDate, 1, referredBy, remaining_days, subscription[0].shopier_link_normal, subscription[0].shopier_link_discount]
         );
 
         // ✅ Insert New Promo Code in promocode table
@@ -323,43 +315,34 @@ export const signUp = async (req, res) => {
             ? "User registered successfully. Promo code applied (20% discount)."
             : "User registered successfully.";
 
-
-        if (selectedPlan.toLowerCase() === "1 month") {
-            const newdatasss = await pool.query(
+        if (selectedPlan.toLowerCase() === "1 month" || selectedPlan.toLowerCase() === "30 days") {
+            await pool.query(
                 "INSERT INTO progress_tracking (user_id, books_completed) VALUES (?, 0) ON DUPLICATE KEY UPDATE books_completed = books_completed",
                 [userId]
             );
-
-            console.log("newdatasss", newdatasss);
         }
-
 
         let challengeMessage = "";
-        if (selectedPlan.toLowerCase() === "1 month") {
+        if (selectedPlan.toLowerCase() === "1 month" || selectedPlan.toLowerCase() === "30 days") {
             challengeMessage = "Complete the 30 Days Challenge and get 11 Months free!";
-        } else if (selectedPlan.toLowerCase() === "6 months" || selectedPlan.toLowerCase() === "1 year") {
-            challengeMessage = "";
         }
-
 
         // **Send Email with the Generated Promo Code**
         let transporter = nodemailer.createTransport({
             service: 'gmail',
             auth: {
-                user: 'packageitappofficially@gmail.com',  // Sender email
-                pass: 'epvuqqesdioohjvi',  // Email password (replace with actual credentials)
+                user: 'packageitappofficially@gmail.com',
+                pass: 'epvuqqesdioohjvi',
             },
         });
 
         let mailOptions = {
-            from: 'gautambairagi221999@gmail.com',  // Sender email
+            from: 'gautambairagi221999@gmail.com',
             to: email,
             subject: 'Welcome to our Service!',
             text: `Hello ${firstname},\n\nYou have successfully signed up!\n\nYour selected plan: ${selectedPlan}\nTotal amount: ${finalAmount}\nPromo Code: ${generatedPromoCode}\n\nThank you for choosing us!`,
-
         };
 
-        // Send the email
         transporter.sendMail(mailOptions, (error, info) => {
             if (error) {
                 console.log('Error sending email:', error);
@@ -2339,9 +2322,12 @@ export const userbyid = async (req, res) => {
                 COALESCE(s.start_date, '') AS start_date,
                 COALESCE(s.end_date, '') AS end_date,
                 COALESCE(s.is_active, 0) AS subscription_active,
-                COALESCE(p.promocode, '') AS promocode
+                COALESCE(p.promocode, '') AS promocode,
+                COALESCE(s.shopier_link_normal, t.shopier_link_normal) AS shopier_link_normal,
+                COALESCE(s.shopier_link_discount, t.shopier_link_discount) AS shopier_link_discount
             FROM users u
             LEFT JOIN subscriptions s ON u.id = s.user_id
+            LEFT JOIN subscriptions t ON s.plan_name = t.plan_name AND t.user_id = 0
             LEFT JOIN promocode p ON u.id = p.user_id
             WHERE u.id = ?`;
 
@@ -2351,25 +2337,30 @@ export const userbyid = async (req, res) => {
             return res.status(404).json({ message: "User not found" });
         }
 
+        const userData = result[0];
         // Determine the challenge message based on the plan name
         let challengeMessage = "";
-        const selectedPlan = result[0].plan_name.toLowerCase();
+        const selectedPlan = userData.plan_name.toLowerCase();
 
-        if (selectedPlan === "1 month") {
+        if (selectedPlan === "1 month" || selectedPlan === "30 days" || selectedPlan === "monthly") {
             challengeMessage = "Complete the 30 Days Challenge and get 11 Months free!";
-        } else if (selectedPlan === "6 months" || selectedPlan === "1 year") {
-            challengeMessage = "Your plan is not valid for the 30 Days Challenge. Please select a 1-month plan.";
         }
+
+        // Determine correct Shopier link
+        const shopierLink = userData.discount_applied > 0
+            ? userData.shopier_link_discount
+            : userData.shopier_link_normal;
 
         return res.status(200).json({
             message: "User fetched successfully",
             data: {
-                ...result[0],
-                challengeMessage, // Include the challenge message in the response
+                ...userData,
+                challengeMessage,
+                shopier_link: shopierLink
             }
         });
     } catch (error) {
-        console.error("Fetch User by ID Error:", error);
+        console.error("Error fetching user by ID:", error);
         return res.status(500).json({ message: "Internal server error", error: error.message });
     }
 };
