@@ -101,7 +101,7 @@ export const getAllUsers = async (req, res) => {
                 user.remaining_days = remainingDays;
 
                 // FINAL LOGIC
-                if (is_active === 1 && remainingDays > 0) {
+                if (is_active === 1 && remainingDays > 0 && user.status === 'active') {
                     user.subscription_status = "Active";
                 } else {
                     user.subscription_status = "Inactive";
@@ -160,10 +160,9 @@ export const getUserById = async (req, res) => {
             const timeDiff = endDate.getTime() - today.getTime();
             let remainingDays = Math.ceil(timeDiff / (1000 * 60 * 60 * 24));
             remainingDays = remainingDays < 0 ? 0 : remainingDays;
-
             user.plan_name = plan_name;
             user.remaining_days = remainingDays;
-            user.subscription_status = endDate >= today ? "Active" : "Inactive";
+            user.subscription_status = (endDate >= today && user.status === 'active') ? "Active" : "Inactive";
         } else {
             user.plan_name = null;
             user.remaining_days = 0;
@@ -230,144 +229,73 @@ export const getUserbyID = async (req, res) => {
 export const signUp = async (req, res) => {
     try {
         const { firstname, email, lastname = "0", password, confirmpassword = "0", selectedPlan, promocode = null, phone_number, whatsapp_number = null } = req.body;
-        console.log("req.body", req.body);
+        console.log("Signup attempt for:", email);
 
-        // Check if the email already exists
-        const [existingUser] = await pool.query("SELECT id FROM users WHERE email=?", [email]);
+        // 1. Check if email already exists
+        const [existingUser] = await pool.query("SELECT id, status FROM users WHERE email=?", [email]);
         if (existingUser.length > 0) {
-            return res.status(403).json({ message: "User already exists" });
+            if (existingUser[0].status === 'active') {
+                return res.status(403).json({ message: "User with this email already exists and is active." });
+            }
+            // If already exists but pending, we can either update or just tell them to pay.
+            return res.status(200).json({
+                success: true,
+                message: "You already have a pending account. Please complete payment.",
+                data: {
+                    id: existingUser[0].id,
+                    email,
+                    plan_name: selectedPlan
+                }
+            });
         }
 
-        // Fetch the selected subscription plan
+        // 2. Fetch the selected subscription plan
         const [subscription] = await pool.query("SELECT * FROM subscriptions WHERE plan_name = ?", [selectedPlan]);
         if (subscription.length === 0) {
             return res.status(400).json({ message: "Selected subscription plan does not exist" });
         }
 
-        let originalAmount = parseFloat(subscription[0].original_price);
-        let finalAmount = originalAmount;
-        let discountApplied = 0;
+        // 3. Hash the password
+        const hashPassword = await bcrypt.hash(password, 10);
+
+        // 4. Create User with 'pending' status
+        const generatedPromoCode = (firstname.substring(0, 3).toUpperCase() + Math.floor(1000 + Math.random() * 9000));
+        
         let referredBy = null;
-        let commissionEarned = 0;
-
-        // ✅ If promocode is provided, validate and apply discount
         if (promocode) {
-            const [promoDetails] = await pool.query("SELECT user_id FROM promocode WHERE promocode = ? AND status = 'active'", [promocode]);
-            if (promoDetails.length > 0) {
-                referredBy = promoDetails[0].user_id;
-
-                // ✅ Always apply 20% discount
-                discountApplied = (originalAmount * 20) / 100;
-                finalAmount = originalAmount - discountApplied;
-
-                // ✅ Commission for referrer (20%)
-                commissionEarned = (originalAmount * 20) / 100;
-
-                // ✅ Insert commission record
-                await pool.query(
-                    "INSERT INTO commission (user_id, earned_by, amount, status) VALUES (?, ?, ?, ?)",
-                    [referredBy, email, commissionEarned, 'pending']
-                );
+            // Check if promo code belongs to a user (Referral)
+            const [referrer] = await pool.query("SELECT id FROM users WHERE promocode = ?", [promocode]);
+            if (referrer.length > 0) {
+                referredBy = referrer[0].id;
             }
         }
 
-        // ✅ Generate a unique promo code for the new user
-        const generatedPromoCode = firstname.substring(0, 3).toUpperCase() + Math.floor(1000 + Math.random() * 9000);
-
-        // ✅ Hash the password
-        const hashPassword = await bcrypt.hash(password, 10);
-
-        // ✅ Insert user data into the database
         const [userResult] = await pool.query(
-            "INSERT INTO users (firstname, lastname, email, password, is_active, confirmpassword, promocode, referred_by, is_logged_in, phone_number, whatsapp_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [firstname, lastname, email, hashPassword, 1, confirmpassword, generatedPromoCode, referredBy, false, phone_number, whatsapp_number]
+            "INSERT INTO users (firstname, lastname, email, password, is_active, confirmpassword, promocode, referred_by, is_logged_in, phone_number, whatsapp_number, status, referral_code_used) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [firstname, lastname, email, hashPassword, 1, confirmpassword, generatedPromoCode, referredBy, false, phone_number, whatsapp_number, 'pending', promocode]
         );
         const userId = userResult.insertId;
 
+        // 5. Create inactive subscription (to be updated on payment)
         const startDate = new Date();
-        let endDate = new Date();
+        const endDate = new Date(startDate);
+        endDate.setMonth(endDate.getMonth() + 1); // Default to 1 month, will be corrected in webhook
 
-        if (selectedPlan.toLowerCase() === "monthly" || selectedPlan.toLowerCase() === "1 month" || selectedPlan.toLowerCase() === "30 days") {
-            endDate.setMonth(endDate.getMonth() + 1);
-        } else if (selectedPlan.toLowerCase() === "6 months") {
-            endDate.setMonth(endDate.getMonth() + 6);
-        } else if (selectedPlan.toLowerCase() === "1 year") {
-            endDate.setFullYear(endDate.getFullYear() + 1);
-        }
-
-        // ✅ Calculate remaining_days
-        const oneDay = 24 * 60 * 60 * 1000;
-        const remaining_days = Math.ceil((endDate - startDate) / oneDay);
-
-        // ✅ Insert Subscription Data
         await pool.query(
-            "INSERT INTO subscriptions (user_id, plan_name, amount, original_price, discount_applied, promocode, start_date, end_date, is_active, referred_by, remaining_days, shopier_link_normal, shopier_link_discount) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [userId, selectedPlan, finalAmount, originalAmount, discountApplied, generatedPromoCode, startDate, endDate, 1, referredBy, remaining_days, subscription[0].shopier_link_normal, subscription[0].shopier_link_discount]
+            "INSERT INTO subscriptions (user_id, plan_name, amount, original_price, discount_applied, start_date, end_date, is_active, promocode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [userId, selectedPlan, subscription[0].amount, subscription[0].original_price, 0, startDate, endDate, 0, promocode]
         );
-
-        // ✅ Insert New Promo Code in promocode table
-        await pool.query(
-            "INSERT INTO promocode (admin_id, promocode, user_id, status) VALUES (?, ?, ?, ?)",
-            [1, generatedPromoCode, userId, 'active']
-        );
-
-        const responseMessage = discountApplied > 0
-            ? "User registered successfully. Promo code applied (20% discount)."
-            : "User registered successfully.";
-
-        if (selectedPlan.toLowerCase() === "1 month" || selectedPlan.toLowerCase() === "30 days") {
-            await pool.query(
-                "INSERT INTO progress_tracking (user_id, books_completed) VALUES (?, 0) ON DUPLICATE KEY UPDATE books_completed = books_completed",
-                [userId]
-            );
-        }
-
-        let challengeMessage = "";
-        if (selectedPlan.toLowerCase() === "1 month" || selectedPlan.toLowerCase() === "30 days") {
-            challengeMessage = "Complete the 30 Days Challenge and get 11 Months free!";
-        }
-
-        // **Send Email with the Generated Promo Code**
-        let transporter = nodemailer.createTransport({
-            service: 'gmail',
-            auth: {
-                user: 'packageitappofficially@gmail.com',
-                pass: 'epvuqqesdioohjvi',
-            },
-        });
-
-        let mailOptions = {
-            from: 'gautambairagi221999@gmail.com',
-            to: email,
-            subject: 'Welcome to our Service!',
-            text: `Hello ${firstname},\n\nYou have successfully signed up!\n\nYour selected plan: ${selectedPlan}\nTotal amount: ${finalAmount}\nPromo Code: ${generatedPromoCode}\n\nThank you for choosing us!`,
-        };
-
-        transporter.sendMail(mailOptions, (error, info) => {
-            if (error) {
-                console.log('Error sending email:', error);
-            } else {
-                console.log('Email sent:', info.response);
-            }
-        });
 
         return res.status(200).json({
-            message: responseMessage,
-            challengeMessage,
+            success: true,
+            message: "Registration successful. Please complete payment to activate your account.",
             data: {
                 id: userId,
-                subscription: {
-                    user_id: userId,
-                    plan_name: selectedPlan,
-                    amount: finalAmount,
-                    original_price: originalAmount,
-                    discount_applied: discountApplied,
-                    promocode: generatedPromoCode,
-                    start_date: startDate.toISOString(),
-                    end_date: endDate.toISOString(),
-                    remaining_days: remaining_days,
-                    is_active: 1
-                }
+                email,
+                shopier_link: subscription[0].shopier_link_normal,
+                plan_name: selectedPlan,
+                original_price: subscription[0].original_price,
+                final_price: subscription[0].amount
             }
         });
 
@@ -457,7 +385,7 @@ export const getPromocodeReferById = async (req, res) => {
             SELECT SUM(CAST(original_price AS DECIMAL(10,2)) * 0.20) AS total_commission
             FROM subscriptions
             JOIN users u ON u.id = subscriptions.user_id
-            WHERE u.referred_by = ?
+            WHERE u.referred_by = ? AND u.status = 'active'
         `, [id]);
 
         const totalCommission = commissionData[0].total_commission || 0;
@@ -472,7 +400,7 @@ export const getPromocodeReferById = async (req, res) => {
                 DATE_FORMAT(u.timestamp, '%M') AS month
             FROM users u
             JOIN subscriptions s ON u.id = s.user_id
-            WHERE u.referred_by = ?
+            WHERE u.referred_by = ? AND u.status = 'active'
         `, [id]);
 
         // Monthly commission summary (Correct Formula + JOIN FIX)
@@ -483,7 +411,7 @@ export const getPromocodeReferById = async (req, res) => {
                 COUNT(*) AS total_referrals
             FROM subscriptions s
             JOIN users u ON u.id = s.user_id
-            WHERE u.referred_by = ?
+            WHERE u.referred_by = ? AND u.status = 'active'
             GROUP BY month
             ORDER BY month DESC
         `, [id]);
@@ -549,7 +477,7 @@ export const getPromocodeRefer = async (req, res) => {
 
 
             const [referrals] = await pool.query(`
-                 SELECTu.id,
+                 SELECT u.id,
                     u.email,
                     MONTH(u.timestamp) AS referred_month,
                     DATE_FORMAT(u.timestamp, '%M') AS month_name,
@@ -557,7 +485,7 @@ export const getPromocodeRefer = async (req, res) => {
             FROM users u
                  LEFT JOIN (
                  SELECT * FROM subscriptions WHERE id IN (
-        SELECT MAX(id) FROM subscriptions GROUP BY user_id )) s ON s.user_id = u.id WHERE u.referred_by = ? AND s.is_active = 1
+        SELECT MAX(id) FROM subscriptions GROUP BY user_id )) s ON s.user_id = u.id WHERE u.referred_by = ? AND s.is_active = 1 AND u.status = 'active'
             `, [user.id]);
             if (referrals.length > 0) {
                 userData.push({
@@ -594,40 +522,32 @@ export const getPromocodeRefer = async (req, res) => {
 
 export const getCommissionDiscount = async (req, res) => {
     try {
-        // Fetch all users with a promo code
-        const [users] = await pool.query("SELECT id, promocode, email FROM users WHERE promocode IS NOT NULL");
+        // Fetch all users who have referred someone
+        const [users] = await pool.query("SELECT DISTINCT u.id, u.email, u.whatsapp_number, u.promocode FROM users u JOIN commission c ON u.id = c.user_id");
+        
         if (users.length === 0) {
-            return res.status(404).json({ message: "No users found with promo codes" });
+            return res.status(404).json({ message: "No commission data found" });
         }
+        
         let userData = [];
         for (let user of users) {
-            // Count total referrals
-            const [referCount] = await pool.query("SELECT COUNT(*) AS count FROM users WHERE referred_by = ?", [user.id]);
-            // Calculate total discount given (20% of referred users' discounts)
-            const [discountData] = await pool.query(`
-                SELECT SUM(discount_applied * 0.20) AS total_discount 
-                FROM subscriptions 
-                WHERE referred_by = ?`,
-                [user.id]
-            );
-            const totalDiscountGiven = discountData[0].total_discount || 0;
-            // **Filter out users where totalDiscountGiven is 0**
-            if (totalDiscountGiven > 0) {
+            const [commData] = await pool.query("SELECT SUM(amount) AS total_commission, COUNT(*) AS referCount FROM commission WHERE user_id = ?", [user.id]);
+            const totalCommission = commData[0].total_commission || 0;
+            
+            if (totalCommission > 0) {
                 userData.push({
                     id: user.id,
                     email: user.email,
+                    whatsapp: user.whatsapp_number,
                     promocode: user.promocode,
-                    referCount: referCount[0].count,
-                    totalDiscountGiven: totalDiscountGiven
+                    referCount: commData[0].referCount,
+                    totalCommission: totalCommission
                 });
             }
         }
-        // If no users have discounts, return a message
-        if (userData.length === 0) {
-            return res.status(404).json({ message: "No users have earned a commission discount" });
-        }
+        
         return res.status(200).json({
-            message: "Users with promo code referrals and earned discounts fetched successfully.",
+            message: "Commission data fetched successfully",
             data: userData
         });
 
@@ -637,50 +557,28 @@ export const getCommissionDiscount = async (req, res) => {
     }
 };
 
-
-export const getCommissionDiscountBYID = async (req, res) => {
+export const getAllCommissions = async (req, res) => {
     try {
+        const [commissions] = await pool.query(`
+            SELECT 
+                c.id, 
+                c.amount, 
+                c.status, 
+                c.timestamp, 
+                u.email AS referrer_email, 
+                u.whatsapp_number AS referrer_whatsapp,
+                c.earned_by AS referral_email
+            FROM commission c
+            JOIN users u ON c.user_id = u.id
+            ORDER BY c.timestamp DESC
+        `);
 
-        const id = req.params;
-        // Fetch all users with a promo code
-        const [users] = await pool.query("SELECT id, promocode, email FROM users WHERE promocode IS NOT NULL");
-        if (users.length === 0) {
-            return res.status(404).json({ message: "No users found with promo codes" });
+        if (commissions.length > 0) {
+            return res.status(200).json({ message: "All commissions fetched successfully", data: commissions });
+        } else {
+            return res.status(404).json({ message: "No commission records found" });
         }
-        let userData = [];
-        for (let user of users) {
-            // Count total referrals
-            const [referCount] = await pool.query("SELECT COUNT(*) AS count FROM users WHERE referred_by = ?", [user.id]);
-            // Calculate total discount given (20% of referred users' discounts)
-            const [discountData] = await pool.query(`
-                SELECT SUM(discount_applied * 0.20) AS total_discount 
-                FROM subscriptions 
-                WHERE referred_by = ?`,
-                [user.id]
-            );
-            const totalDiscountGiven = discountData[0].total_discount || 0;
-            // **Filter out users where totalDiscountGiven is 0**
-            if (totalDiscountGiven > 0) {
-                userData.push({
-                    id: user.id,
-                    email: user.email,
-                    promocode: user.promocode,
-                    referCount: referCount[0].count,
-                    totalDiscountGiven: totalDiscountGiven
-                });
-            }
-        }
-        // If no users have discounts, return a message
-        if (userData.length === 0) {
-            return res.status(404).json({ message: "No users have earned a commission discount" });
-        }
-        return res.status(200).json({
-            message: "Users with promo code referrals and earned discounts fetched successfully.",
-            data: userData
-        });
-
     } catch (error) {
-        console.error("getCommissionDiscount Error:", error);
         return res.status(500).json({ message: "Internal server error", error: error.message });
     }
 };
@@ -825,7 +723,6 @@ export const login = async (req, res) => {
         let remaining_days = 0;
         let subscription_status = "Inactive";
         if (subscriptionResult.length > 0) {
-            const startDate = new Date(subscriptionResult[0].start_date);
             const endDate = new Date(subscriptionResult[0].end_date);
             const today = new Date();
             const timeDiff = endDate.getTime() - today.getTime();
@@ -833,33 +730,32 @@ export const login = async (req, res) => {
             remaining_days = remaining_days < 0 ? 0 : remaining_days;
 
             const is_active = subscriptionResult[0].is_active;
-            subscription_status = (is_active === 1 && remaining_days > 0) ? "Active" : "Inactive";
-
+            subscription_status = (is_active === 1 && remaining_days > 0 && user.status === 'active') ? "Active" : "Inactive";
         }
 
-        if (subscription_status === "Active") {
-            // check already logged-in
-            if (user.is_logged_in) {
-                return res.status(403).json({
-                    message: "User is already logged in on another device."
-                });
-            }
-
-            // UPDATE only when ACTIVE
-            await pool.query(
-                "UPDATE users SET last_login = NOW(), is_logged_in = 1 WHERE id = ?",
-                [user.id]
-            );
-
-        } else {
-            // subscription inactive → DO NOT UPDATE is_logged_in (leave it same)
-            await pool.query(
-                "UPDATE users SET last_login = NOW() WHERE id = ?",
-                [user.id]
-            );
+        // STRICT RULE: Login is ONLY allowed after successful payment.
+        // If status is 'pending' or subscription is not active → block login.
+        if (subscription_status !== "Active") {
+            return res.status(403).json({
+                message: "Payment required. Please complete your payment to access your account.",
+                subscription_status: subscription_status,
+                status: user.status,
+                remaining_days: remaining_days
+            });
         }
 
+        // Block already-logged-in sessions
+        if (user.is_logged_in) {
+            return res.status(403).json({
+                message: "User is already logged in on another device."
+            });
+        }
 
+        // Mark login time
+        await pool.query(
+            "UPDATE users SET last_login = NOW(), is_logged_in = 1 WHERE id = ?",
+            [user.id]
+        );
 
         const token = await generatetoken(user.id, "user");
         return res.status(200).json({
@@ -875,7 +771,8 @@ export const login = async (req, res) => {
                 subscription_status: subscription_status,
                 promocode: user.promocode,
             },
-            role: "user", token
+            role: "user",
+            token
         });
     } catch (error) {
         return res.status(500).json({ message: "Internal server error", error: error.message });
@@ -2310,58 +2207,108 @@ export const getbyidtest = async (req, res) => {
 export const userbyid = async (req, res) => {
     try {
         const { id } = req.params;
-        const query = `
-            SELECT 
-                u.id, u.firstname, u.lastname, u.email, u.is_active, 
-                COALESCE(s.plan_name, '') AS plan_name,
-                COALESCE(s.original_price, 0) AS original_price,
-                COALESCE(s.discount_applied, 0) AS discount_applied,
-                COALESCE(s.amount, 0) AS final_amount,  
-                (COALESCE(s.discount_applied, 0) / COALESCE(s.original_price, 1)) * 100 AS discount_percent,
-                COALESCE(s.original_price, 0) - COALESCE(s.discount_applied, 0) AS final_price,
-                COALESCE(s.start_date, '') AS start_date,
-                COALESCE(s.end_date, '') AS end_date,
-                COALESCE(s.is_active, 0) AS subscription_active,
-                COALESCE(p.promocode, '') AS promocode,
-                COALESCE(s.shopier_link_normal, t.shopier_link_normal) AS shopier_link_normal,
-                COALESCE(s.shopier_link_discount, t.shopier_link_discount) AS shopier_link_discount
-            FROM users u
-            LEFT JOIN subscriptions s ON u.id = s.user_id
-            LEFT JOIN subscriptions t ON s.plan_name = t.plan_name AND t.user_id = 0
-            LEFT JOIN promocode p ON u.id = p.user_id
-            WHERE u.id = ?`;
 
-        const [result] = await pool.query(query, [id]);
+        // 1. Try finding in active users first
+        let [userRows] = await pool.query("SELECT * FROM users WHERE id = ?", [id]);
+        
+        if (userRows.length === 0) {
+            // 2. Try finding in temp_registrations (for checkout before payment)
+            const [tempRows] = await pool.query("SELECT * FROM temp_registrations WHERE id = ?", [id]);
+            
+            if (tempRows.length > 0) {
+                const tempUser = tempRows[0];
+                const [plan] = await pool.query("SELECT * FROM subscriptions WHERE plan_name = ?", [tempUser.selectedPlan]);
+                
+                let originalPrice = parseFloat(plan[0].original_price);
+                let discountApplied = 0;
+                let finalPrice = originalPrice;
 
-        if (result.length === 0) {
-            return res.status(404).json({ message: "User not found" });
+                if (tempUser.promocode) {
+                    discountApplied = (originalPrice * 20) / 100;
+                    finalPrice = originalPrice - discountApplied;
+                }
+
+                return res.status(200).json({
+                    status: "true",
+                    message: "Temp registration data found",
+                    data: {
+                        id: tempUser.id,
+                        firstname: tempUser.firstname,
+                        email: tempUser.email,
+                        plan_name: tempUser.selectedPlan,
+                        original_price: originalPrice,
+                        discount_applied: discountApplied,
+                        final_price: finalPrice,
+                        shopier_link: plan[0].shopier_link_normal,
+                        is_active: 0,
+                        challengeMessage: tempUser.selectedPlan.toLowerCase().includes("month") ? "Complete the 30 Days Challenge and get 11 Months free!" : ""
+                    }
+                });
+            }
+            
+            return res.status(404).json({ status: "false", message: "User not found" });
         }
 
-        const userData = result[0];
-        // Determine the challenge message based on the plan name
-        let challengeMessage = "";
-        const selectedPlan = userData.plan_name.toLowerCase();
+        const user = userRows[0];
+        const subscriptionQuery = `
+            SELECT s.* 
+            FROM subscriptions s 
+            WHERE s.user_id = ? 
+            ORDER BY s.id DESC LIMIT 1
+        `;
+        const [subscriptionResult] = await pool.query(subscriptionQuery, [user.id]);
 
-        if (selectedPlan === "1 month" || selectedPlan === "30 days" || selectedPlan === "monthly") {
+        let remainingDays = 0;
+        let subscriptionStatus = "Inactive";
+        let plan_name = "";
+        let original_price = "";
+        let discount_applied = 0;
+        let final_price = 0;
+        let shopier_link = "";
+
+        if (subscriptionResult.length > 0) {
+            const sub = subscriptionResult[0];
+            const endDate = new Date(sub.end_date);
+            const today = new Date();
+            remainingDays = Math.ceil((endDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+            remainingDays = remainingDays < 0 ? 0 : remainingDays;
+            
+            subscriptionStatus = (sub.is_active === 1 && remainingDays > 0 && user.status === 'active') ? "Active" : "Inactive";
+            plan_name = sub.plan_name;
+            original_price = sub.original_price;
+            discount_applied = sub.discount_applied;
+            final_price = sub.amount;
+            shopier_link = sub.shopier_link_normal;
+        }
+
+        let challengeMessage = "";
+        if (plan_name.toLowerCase() === "1 month" || plan_name.toLowerCase() === "30 days") {
             challengeMessage = "Complete the 30 Days Challenge and get 11 Months free!";
         }
 
-        // Determine correct Shopier link
-        const shopierLink = userData.discount_applied > 0
-            ? userData.shopier_link_discount
-            : userData.shopier_link_normal;
-
-        return res.status(200).json({
-            message: "User fetched successfully",
+        res.status(200).json({
+            status: "true",
+            message: "User details retrieved successfully",
             data: {
-                ...userData,
-                challengeMessage,
-                shopier_link: shopierLink
+                id: user.id,
+                firstname: user.firstname,
+                email: user.email,
+                phone_number: user.phone_number,
+                whatsapp_number: user.whatsapp_number,
+                promocode: user.promocode,
+                plan_name,
+                remaining_days: remainingDays,
+                subscription_status: subscriptionStatus,
+                original_price,
+                discount_applied,
+                final_price,
+                shopier_link,
+                challengeMessage
             }
         });
     } catch (error) {
-        console.error("Error fetching user by ID:", error);
-        return res.status(500).json({ message: "Internal server error", error: error.message });
+        console.error("Error retrieving user details:", error);
+        res.status(500).json({ status: "false", message: "Internal server error" });
     }
 };
 
@@ -2634,11 +2581,32 @@ export const submitChallengeTest = async (req, res) => {
         // ✅ Step 4: Update progress if test passed
         if (status === "Completed Successfully") {
             await pool.query(
-                `UPDATE progress_tracking
-     SET books_completed = books_completed + 1
-     WHERE user_id = ?`,
+                `UPDATE progress_tracking 
+                 SET books_completed = books_completed + 1 
+                 WHERE user_id = ?`, 
                 [user_id]
             );
+
+            // ✅ Step 4.1: Check for Reward (Complete 30 Books -> Get 11 Months Free)
+            const [progress] = await pool.query("SELECT books_completed FROM progress_tracking WHERE user_id = ?", [user_id]);
+            if (progress.length > 0 && progress[0].books_completed >= 30) {
+                // Check if already rewarded to avoid duplicate extensions
+                const [sub] = await pool.query(
+                    "SELECT id, end_date, challenge_eligible FROM subscriptions WHERE user_id = ? AND is_active = 1 AND challenge_eligible != 'rewarded' LIMIT 1", 
+                    [user_id]
+                );
+
+                if (sub.length > 0) {
+                    let currentEndDate = new Date(sub[0].end_date);
+                    currentEndDate.setMonth(currentEndDate.getMonth() + 11); // 🎁 Add 11 Months
+                    
+                    await pool.query(
+                        "UPDATE subscriptions SET end_date = ?, challenge_eligible = 'rewarded' WHERE id = ?", 
+                        [currentEndDate, sub[0].id]
+                    );
+                    console.log(`🎁 CHALLENGE COMPLETE: User ${user_id} granted 11 months free extension.`);
+                }
+            }
         }
 
         // ✅ Step 5: Respond
@@ -3214,6 +3182,90 @@ export const updateUserSubscription = async (req, res) => {
         res.status(500).json({ status: "false", message: "Internal server error" });
     }
 };
+
+export const shopierWebhook = async (req, res) => {
+    try {
+        const { status, email, res_payment_status } = req.body;
+        const paymentStatus = res_payment_status || status;
+
+        if (paymentStatus === 'success') {
+            // 1. Fetch pending user from users table
+            const [users] = await pool.query("SELECT * FROM users WHERE email = ? AND status = 'pending'", [email]);
+            
+            if (users.length > 0) {
+                const user = users[0];
+                const userId = user.id;
+
+                // 2. Activate user
+                await pool.query(
+                    "UPDATE users SET status = 'active', membership_start_date = NOW() WHERE id = ?",
+                    [userId]
+                );
+
+                // 3. Update subscription with fresh dates (Payment date = Start date)
+                const [subRows] = await pool.query(
+                    "SELECT plan_name FROM subscriptions WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+                    [userId]
+                );
+                
+                if (subRows.length > 0) {
+                    const selectedPlan = subRows[0].plan_name;
+                    const startDate = new Date(); // Payment date
+                    let endDate = new Date(startDate);
+
+                    if (selectedPlan.toLowerCase().includes("month") || selectedPlan.toLowerCase().includes("30 days")) {
+                        endDate.setMonth(endDate.getMonth() + 1);
+                    } else if (selectedPlan.toLowerCase().includes("6 months")) {
+                        endDate.setMonth(endDate.getMonth() + 6);
+                    } else if (selectedPlan.toLowerCase().includes("year")) {
+                        endDate.setFullYear(endDate.getFullYear() + 1);
+                    }
+
+                    // Fetch plan details for pricing
+                    const [planTemplate] = await pool.query("SELECT * FROM subscriptions WHERE plan_name = ? LIMIT 1", [selectedPlan]);
+                    const originalPrice = parseFloat(planTemplate[0]?.original_price || 449);
+                    let discountApplied = 0;
+                    if (user.referral_code_used) discountApplied = (originalPrice * 20) / 100;
+                    const finalAmount = originalPrice - discountApplied;
+                    const remaining_days = Math.ceil((endDate - startDate) / (1000 * 60 * 60 * 24));
+
+                    await pool.query(
+                        "UPDATE subscriptions SET amount = ?, original_price = ?, discount_applied = ?, start_date = ?, end_date = ?, is_active = 1, remaining_days = ? WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+                        [finalAmount, originalPrice, discountApplied, startDate, endDate, remaining_days, userId]
+                    );
+
+                    // 4. Promo Code & Challenge
+                    await pool.query("UPDATE promocode SET status = 'active' WHERE user_id = ?", [userId]);
+
+                    if (selectedPlan.toLowerCase().includes("month") || selectedPlan.toLowerCase().includes("30 days")) {
+                        await pool.query("INSERT INTO progress_tracking (user_id, books_completed) VALUES (?, 0) ON DUPLICATE KEY UPDATE user_id=user_id", [userId]);
+                    }
+
+                    // 5. Trigger Referral Commission (Rule #5)
+                    if (user.referral_code_used && user.referred_by) {
+                        const commissionEarned = (originalPrice * 20) / 100;
+                        const [existingComm] = await pool.query("SELECT id FROM commission WHERE user_id = ? AND earned_by = ?", [user.referred_by, email]);
+                        if (existingComm.length === 0) {
+                            await pool.query(
+                                "INSERT INTO commission (user_id, earned_by, amount, status) VALUES (?, ?, ?, ?)",
+                                [user.referred_by, email, commissionEarned, 'pending']
+                            );
+                        }
+                    }
+                }
+
+                console.log(`✅ User ${userId} (${email}) activated via Shopier webhook.`);
+                return res.status(200).send("OK");
+            }
+        }
+        
+        return res.status(200).send("No action taken");
+    } catch (error) {
+        console.error("❌ Webhook Error:", error.message);
+        return res.status(500).send("Internal Server Error");
+    }
+};
+
 
 
 
