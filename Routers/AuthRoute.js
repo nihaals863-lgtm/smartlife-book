@@ -59,12 +59,10 @@ import {
     updateUserSubscription,
     checkBookAttempt,
     getReferredUsers,
-    getUserById,
-    shopierWebhook,
-    getAllCommissions
+    getUserById
+   
 
 } from "../Controllers/AuthCtrl.js";
-import { checkUserActive } from "../Middlewares/checkUserActive.js";
 const router = express.Router();
 router.get("/users", getAllUsers);
 router.get("/users/:id", getUserById);
@@ -84,7 +82,7 @@ router.put("/book/:id", editBook);
 router.get("/getAllUsersWithPromo", getAllUsersWithPromo);
 router.post("/createSubscriptionByAdmin", createSubscriptionByAdmin);
 router.put("/cancelSubscription/:user_id", cancelSubscription);
-router.post("/updateProgress", checkUserActive, updateProgress);
+router.post("/updateProgress", updateProgress);
 router.get("/getUserProgress/:user_id", getUserProgress);
 router.get("/getBookByCategoryId/:id", getBookByCategoryId);
 router.get("/getAllUserProgress", getAllUserProgress);
@@ -95,12 +93,12 @@ router.get("/getReferralStats", getReferralStats);
 router.post("/createpromocode", createpromocode);
 router.get("/getquestionanswerbyid/:id", getquestionanswerbyid);
 router.get("/getbyidtest/:id", getbyidtest);
-router.post("/submittest", checkUserActive, submittest);
+router.post("/submittest", submittest);
 router.get("/GetCompletedBooks", GetCompletedBooks);
 router.get("/GetCompletedBooks/:id", GetCompletedBooksByUserId);
 router.get("/user/:id", userbyid);
-router.post("/startChallenge", checkUserActive, startChallenge);
-router.post("/submitChallengeTest", checkUserActive, submitChallengeTest);
+router.post("/startChallenge", startChallenge);
+router.post("/submitChallengeTest", submitChallengeTest);
 router.get("/check", checkBookAttempt);
 router.get("/getUserChallengeProgress/:user_id", getUserChallengeProgress);
 router.get("/gatallUserChallengeProgreses", gatallUserChallengeProgreses);
@@ -112,13 +110,13 @@ router.get("/getsubscriptionByid/:id", getsubscriptionByid);
 router.get("/getCommissionDiscount", getCommissionDiscount);
 router.delete("/SubscriptionDelete/:id", SubscriptionDelete);
 router.get("/reviews/:bookId", getReviewsByBookId);
-router.post("/reviews", checkUserActive, submitReview);
+router.post("/reviews", submitReview);
 router.put("/reviews/:id", updateReview);
 router.delete("/reviews/:id", deleteReview);
 router.get("/getReviews", getReviews);
 router.get("/getReviewsApproved", getReviewsApproved);
 router.put("/reviews/status/:id", updateReviewStatus);
-router.post("/adioprogress", checkUserActive, saveOrUpdateAudioProgress);
+router.post("/adioprogress", saveOrUpdateAudioProgress);
 router.get("/getAudioProgress", getAudioProgress);
 router.post("/logout", logout);
 router.post("/saveUserVisited", saveUserVisited);
@@ -135,16 +133,6 @@ router.get('/updateVisitedUsersStatus', updateVisitedUsersStatus);
 router.put("/upgradesubscription", upgradeUserSubscription);
 
 router.put("/updateUserSubscription/:userId", updateUserSubscription);
-
-// Shopier Webhook (Independent and add-only)
-router.post("/shopier/webhook", shopierWebhook);
-
-// Commission Management
-router.get("/getallcomitions", getAllCommissions);
-
-// Example of protecting premium routes (applying checkUserActive)
-// Note: In real scenarios, these would be applied to dashboard, paid content, etc.
-// router.get("/premium-feature", checkUserActive, premiumFeatureController);
 
 
 
