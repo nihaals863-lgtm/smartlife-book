@@ -10,6 +10,10 @@ import routes from "./app.js";
 import multer from "multer";
 import cookieParser from "cookie-parser";
 import './cron/dailyEmailSender.js';
+import deactivateExpiredSubscriptions from './cron/subscriptionDeactivation.js';
+
+// ✅ Clean up expired subscriptions on startup
+deactivateExpiredSubscriptions();
 
 
 dotenv.config();

@@ -119,7 +119,10 @@ const sendWelcomeEmail = async (email, firstname, selectedPlan, finalAmount, gen
 // ─────────────────────────────────────────────────────
 //  HELPER: Create user after confirmed payment
 // ─────────────────────────────────────────────────────
-const createUserAfterPayment = async (pendingData, shopierOrderId) => {
+// ─────────────────────────────────────────────────────
+//  HELPER: Activate/Update user after confirmed payment
+// ─────────────────────────────────────────────────────
+const activateUserAndSubscription = async (pendingData, shopierOrderId) => {
     const {
         firstname,
         lastname,
@@ -137,71 +140,107 @@ const createUserAfterPayment = async (pendingData, shopierOrderId) => {
         shopier_link_discount
     } = pendingData;
 
-    // ✅ Generate promo code for new user
-    const generatedPromoCode = firstname.substring(0, 3).toUpperCase() + Math.floor(1000 + Math.random() * 9000);
+    try {
+        // ✅ Check if user already exists
+        const [existingUsers] = await pool.query("SELECT id FROM users WHERE email = ?", [email]);
+        let userId;
+        let generatedPromoCode;
 
-    // ✅ Insert user (is_active = 1 since payment confirmed)
-    const [userResult] = await pool.query(
-        "INSERT INTO users (firstname, lastname, email, password, is_active, confirmpassword, promocode, referred_by, is_logged_in, phone_number, whatsapp_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        [firstname, lastname || "0", email, password_hash, 1, "0", generatedPromoCode, referred_by_id || null, false, phone_number, whatsapp_number || null]
-    );
-    const userId = userResult.insertId;
+        if (existingUsers.length > 0) {
+            userId = existingUsers[0].id;
+            console.log(`ℹ️ Updating existing user: ${email} (ID: ${userId})`);
+            
+            // Update user to active and sync details
+            await pool.query(
+                "UPDATE users SET firstname = ?, lastname = ?, is_active = 1, password = ?, phone_number = ?, whatsapp_number = ? WHERE id = ?",
+                [firstname, lastname || "0", password_hash, phone_number, whatsapp_number || null, userId]
+            );
 
-    // ✅ Calculate subscription dates from PAYMENT DATE (today)
-    const startDate = new Date();
-    let endDate = new Date();
-    const planLower = selected_plan.toLowerCase();
+            // Get existing promocode or generate new one
+            const [userPromo] = await pool.query("SELECT promocode FROM users WHERE id = ?", [userId]);
+            generatedPromoCode = userPromo[0]?.promocode;
+            
+            if (!generatedPromoCode) {
+                generatedPromoCode = firstname.substring(0, 3).toUpperCase() + Math.floor(1000 + Math.random() * 9000);
+                await pool.query("UPDATE users SET promocode = ? WHERE id = ?", [generatedPromoCode, userId]);
+            }
+        } else {
+            console.log(`ℹ️ Creating new user: ${email}`);
+            // ✅ Generate promo code for new user
+            generatedPromoCode = firstname.substring(0, 3).toUpperCase() + Math.floor(1000 + Math.random() * 9000);
 
-    if (planLower.includes("30") || planLower.includes("1 month") || planLower.includes("monthly")) {
-        endDate.setMonth(endDate.getMonth() + 1);
-    } else if (planLower.includes("6 month")) {
-        endDate.setMonth(endDate.getMonth() + 6);
-    } else if (planLower.includes("1 year") || planLower.includes("annual") || planLower.includes("12")) {
-        endDate.setFullYear(endDate.getFullYear() + 1);
-    } else {
-        endDate.setMonth(endDate.getMonth() + 1); // default 1 month
-    }
+            // ✅ Insert user (is_active = 1 since payment confirmed)
+            const [userResult] = await pool.query(
+                "INSERT INTO users (firstname, lastname, email, password, is_active, confirmpassword, promocode, referred_by, is_logged_in, phone_number, whatsapp_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [firstname, lastname || "0", email, password_hash, 1, "0", generatedPromoCode, referred_by_id || null, false, phone_number, whatsapp_number || null]
+            );
+            userId = userResult.insertId;
+        }
 
-    const oneDay = 24 * 60 * 60 * 1000;
-    const remaining_days = Math.ceil((endDate - startDate) / oneDay);
+        // ✅ Calculate subscription dates from PAYMENT DATE (today)
+        const startDate = new Date();
+        let endDate = new Date();
+        const planLower = (selected_plan || "").toLowerCase();
 
-    // ✅ Insert subscription (is_active = 1, start from payment date)
-    await pool.query(
-        "INSERT INTO subscriptions (user_id, plan_name, amount, original_price, discount_applied, promocode, start_date, end_date, is_active, referred_by, remaining_days, shopier_link_normal, shopier_link_discount) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        [userId, selected_plan, final_amount, original_amount, discount_applied, generatedPromoCode, startDate, endDate, 1, referred_by_id || null, remaining_days, shopier_link_normal, shopier_link_discount]
-    );
+        if (planLower.includes("30") || planLower.includes("1 month") || planLower.includes("monthly")) {
+            endDate.setMonth(endDate.getMonth() + 1);
+        } else if (planLower.includes("6 month")) {
+            endDate.setMonth(endDate.getMonth() + 6);
+        } else if (planLower.includes("1 year") || planLower.includes("annual") || planLower.includes("12")) {
+            endDate.setFullYear(endDate.getFullYear() + 1);
+        } else {
+            endDate.setMonth(endDate.getMonth() + 1); // default 1 month
+        }
 
-    // ✅ Insert promo code record
-    await pool.query(
-        "INSERT INTO promocode (admin_id, promocode, user_id, status) VALUES (?, ?, ?, ?)",
-        [1, generatedPromoCode, userId, "active"]
-    );
+        const oneDay = 24 * 60 * 60 * 1000;
+        const remaining_days = Math.ceil((endDate - startDate) / oneDay);
 
-    // ✅ Create commission ONLY after payment confirmed
-    if (referred_by_id && discount_applied > 0) {
-        const commissionEarned = parseFloat(original_amount) * 0.20;
+        // ✅ Insert/Update subscription (is_active = 1, start from payment date)
         await pool.query(
-            "INSERT INTO commission (user_id, earned_by, amount, status) VALUES (?, ?, ?, ?)",
-            [referred_by_id, email, commissionEarned, "pending"]
+            `INSERT INTO subscriptions 
+             (user_id, plan_name, amount, original_price, discount_applied, promocode, start_date, end_date, is_active, referred_by, remaining_days, shopier_link_normal, shopier_link_discount) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE 
+             plan_name = VALUES(plan_name), amount = VALUES(amount), end_date = VALUES(end_date), is_active = 1, remaining_days = VALUES(remaining_days)`,
+            [userId, selected_plan, final_amount, original_amount, discount_applied, generatedPromoCode, startDate, endDate, 1, referred_by_id || null, remaining_days, shopier_link_normal, shopier_link_discount]
         );
-        console.log(`✅ Commission created: ₺${commissionEarned} for user_id ${referred_by_id}`);
-    }
 
-    // ✅ Progress tracking for 30-day plan
-    if (planLower.includes("30") || planLower.includes("1 month") || planLower.includes("monthly")) {
+        // ✅ Ensure promo code entry exists
         await pool.query(
-            "INSERT INTO progress_tracking (user_id, books_completed) VALUES (?, 0) ON DUPLICATE KEY UPDATE books_completed = books_completed",
-            [userId]
+            "INSERT INTO promocode (admin_id, promocode, user_id, status) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE status = 'active'",
+            [1, generatedPromoCode, userId, "active"]
         );
+
+        // ✅ Create commission ONLY after payment confirmed
+        if (referred_by_id && discount_applied > 0) {
+            const commissionEarned = parseFloat(original_amount) * 0.20;
+            await pool.query(
+                "INSERT INTO commission (user_id, earned_by, amount, status) VALUES (?, ?, ?, ?)",
+                [referred_by_id, email, commissionEarned, "pending"]
+            );
+            console.log(`✅ Commission created: ₺${commissionEarned} for user_id ${referred_by_id}`);
+        }
+
+        // ✅ Progress tracking for 1 month plans
+        if (planLower.includes("30") || planLower.includes("1 month") || planLower.includes("monthly")) {
+            await pool.query(
+                "INSERT INTO progress_tracking (user_id, books_completed) VALUES (?, 0) ON DUPLICATE KEY UPDATE books_completed = books_completed",
+                [userId]
+            );
+        }
+
+        // ✅ Send welcome email
+        await sendWelcomeEmail(email, firstname, selected_plan, final_amount, generatedPromoCode);
+
+        console.log(`✅ User ${existingUsers.length > 0 ? 'activated' : 'created'} after payment: userId=${userId}, email=${email}`);
+
+        return { userId, generatedPromoCode };
+    } catch (err) {
+        console.error("❌ Error in activateUserAndSubscription:", err.message);
+        throw err;
     }
-
-    // ✅ Send welcome email
-    await sendWelcomeEmail(email, firstname, selected_plan, final_amount, generatedPromoCode);
-
-    console.log(`✅ User created after payment: userId=${userId}, email=${email}, plan=${selected_plan}`);
-
-    return { userId, generatedPromoCode };
 };
+
 
 
 // ─────────────────────────────────────────────────────
@@ -319,10 +358,6 @@ export const shopierWebhook = async (req, res) => {
 
         const payload = req.body;
 
-        // Shopier sends different payload structures - handle both
-        // Standard webhook: { event: "order.created", data: { id, buyer_email, ... } }
-        // Callback form POST: { platform_order_id, buyer_email, status, ... }
-
         let orderId = null;
         let buyerEmail = null;
         let paymentStatus = null;
@@ -398,20 +433,8 @@ export const shopierWebhook = async (req, res) => {
 
         const pendingData = pendingRows[0];
 
-        // Check if user was already created (idempotency)
-        const [existingCreated] = await pool.query(
-            "SELECT id FROM users WHERE email = ?",
-            [buyerEmail]
-        );
-        if (existingCreated.length > 0) {
-            console.log(`⚠️ User already exists for email=${buyerEmail}. Skipping duplicate creation.`);
-            // Clean up pending
-            await pool.query("DELETE FROM pending_signups WHERE email = ?", [buyerEmail]);
-            return;
-        }
-
-        // ✅ CREATE USER + SUBSCRIPTION + COMMISSION (ONLY after confirmed payment)
-        const { userId, generatedPromoCode } = await createUserAfterPayment(pendingData, orderId);
+        // ✅ ACTIVATE USER + SUBSCRIPTION + COMMISSION (ONLY after confirmed payment)
+        const { userId, generatedPromoCode } = await activateUserAndSubscription(pendingData, orderId);
 
         // ✅ Clean up pending signup
         await pool.query("DELETE FROM pending_signups WHERE email = ?", [buyerEmail]);
@@ -422,12 +445,13 @@ export const shopierWebhook = async (req, res) => {
             [buyerEmail, orderId || "UNKNOWN", userId, pendingData.selected_plan, pendingData.final_amount, userId]
         );
 
-        console.log(`✅ PAYMENT CONFIRMED & USER CREATED: userId=${userId}, email=${buyerEmail}`);
+        console.log(`✅ PAYMENT CONFIRMED & USER ACTIVATED: userId=${userId}, email=${buyerEmail}`);
 
     } catch (error) {
         console.error("❌ shopierWebhook Error:", error);
     }
 };
+
 
 
 // ─────────────────────────────────────────────────────
@@ -452,12 +476,6 @@ export const manualVerifyPayment = async (req, res) => {
         }
 
         const pendingData = pendingRows[0];
-
-        // Check if user already exists
-        const [existing] = await pool.query("SELECT id FROM users WHERE email = ?", [email]);
-        if (existing.length > 0) {
-            return res.status(400).json({ message: "User already created for this email", userId: existing[0].id });
-        }
 
         // Verify via Shopier API
         let orderVerified = false;
@@ -494,16 +512,18 @@ export const manualVerifyPayment = async (req, res) => {
             });
         }
 
-        // Create user
-        const { userId, generatedPromoCode } = await createUserAfterPayment(pendingData, order_id || "MANUAL");
+        // Activate/Create user
+        const { userId, generatedPromoCode } = await activateUserAndSubscription(pendingData, order_id || "MANUAL");
 
         // Clean up
         await pool.query("DELETE FROM pending_signups WHERE email = ?", [email]);
 
         return res.status(200).json({
-            message: "✅ Payment verified. User account created and activated.",
+            message: "✅ Payment verified. User account activated.",
             data: { userId, email, plan: pendingData.selected_plan, promoCode: generatedPromoCode }
         });
+
+
 
     } catch (error) {
         console.error("❌ manualVerifyPayment Error:", error);
