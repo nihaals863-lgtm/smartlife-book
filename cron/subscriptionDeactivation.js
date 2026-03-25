@@ -1,5 +1,6 @@
 import cron from "node-cron";
-import pool from "../Config/Database.js";
+import { pool } from "../Config/dbConnect.js";
+
 
 /**
  * Subscription Deactivation Cron Job
