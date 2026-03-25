@@ -59,14 +59,30 @@ const storage = multer.diskStorage({
 const upload = multer({ storage: storage });
 
 // ✅ Proper CORS Configuration
-app.use(
-    cors({
-        origin: "*", // Sabhi origins allowed hain
-        methods: ["GET", "POST", "PUT", "DELETE", "PATCH"], // ✅ Specific HTTP methods allow kar rahe hain
-        allowedHeaders: ["Content-Type", "Authorization"], // ✅ Required headers allow karein
-        credentials: true, // ✅ Agar cookies allow karni hain
-    })
-);
+// app.use(
+//     cors({
+//         origin: "*", // Sabhi origins allowed hain
+//         methods: ["GET", "POST", "PUT", "DELETE", "PATCH"], // ✅ Specific HTTP methods allow kar rahe hain
+//         allowedHeaders: ["Content-Type", "Authorization"], // ✅ Required headers allow karein
+//         credentials: true, // ✅ Agar cookies allow karni hain
+//     })
+// );
+
+
+// ✅ ================= CORS FIX =================
+app.use(cors({
+    origin: "https://smartlifeacademy.io", // ✅ your frontend
+    methods: ["GET", "POST", "PUT", "DELETE", "PATCH"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: true
+}));
+
+// ✅ Handle preflight requests (VERY IMPORTANT)
+app.options("*", cors({
+    origin: "https://smartlifeacademy.io",
+    credentials: true
+}));
+// ✅ ===========================================
 
 app.use(morgan("dev"));
 app.use(bodyParser.json({ limit: "50mb" }));
